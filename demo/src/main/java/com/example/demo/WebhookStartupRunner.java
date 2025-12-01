@@ -13,6 +13,18 @@ import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
+/*
+ * WebhookStartupRunner
+ *
+ * On application start:
+ * 1) Attempt to generate a webhook by calling the vendor endpoint.
+ * 2) If the vendor endpoint is unreachable or doesn't return expected data,
+ *    fall back to a safe simulated webhook (httpbin) using override properties.
+ * 3) If a final query is provided via -Dapp.finalquery or application.properties,
+ *    submit it to the webhook.
+ *
+ * Clear, simple, human-written style.
+ */
 @Component
 public class WebhookStartupRunner implements CommandLineRunner {
 
@@ -37,21 +49,25 @@ public class WebhookStartupRunner implements CommandLineRunner {
     @Value("${app.submit-url}")
     private String submitUrl;
 
-    // Overrides used when real API is unreachable (safe simulation)
+    // Fallback values used when the real vendor API can't be reached
     @Value("${app.override-webhook:https://httpbin.org/post}")
     private String overrideWebhook;
 
     @Value("${app.override-token:SIMULATED_TOKEN}")
     private String overrideToken;
 
+    // Optional: allow final query to be provided from application.properties if CLI quoting is difficult
+    @Value("${app.finalquery:}")
+    private String finalQueryFromProperties;
+
     @Override
     public void run(String... args) throws Exception {
-        System.out.println("➡ Starting webhook flow...");
+        System.out.println(">>> Starting webhook flow");
 
         String webhookUrl = null;
         String accessToken = null;
 
-        // 1) Try to call the real generate endpoint
+        // Try the vendor "generate webhook" endpoint first
         try {
             Map<String, String> body = Map.of(
                     "name", name,
@@ -63,7 +79,7 @@ public class WebhookStartupRunner implements CommandLineRunner {
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<Map<String, String>> request = new HttpEntity<>(body, headers);
 
-            System.out.println("Trying to call generate endpoint: " + generateUrl);
+            System.out.println("Calling generate endpoint: " + generateUrl);
             ResponseEntity<Map> response = restTemplate.postForEntity(generateUrl, request, Map.class);
 
             if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
@@ -75,53 +91,57 @@ public class WebhookStartupRunner implements CommandLineRunner {
                 accessToken = resp.containsKey("accessToken") ? (String) resp.get("accessToken")
                         : (String) resp.getOrDefault("token", null);
 
-                if (webhookUrl == null || accessToken == null) {
-                    System.out.println("Warning: expected keys not found in response. Will fall back to override values.");
+                if (webhookUrl != null && accessToken != null) {
+                    System.out.println("Received webhook URL and access token from vendor.");
                 } else {
-                    System.out.println("Received webhookUrl and accessToken from real API.");
+                    System.out.println("Vendor did not return full data. Will use fallback values.");
                 }
             } else {
-                System.out.println("Generate endpoint did not return usable body. Falling back to overrides.");
+                System.out.println("Vendor response not usable. Falling back to overrides.");
             }
 
         } catch (ResourceAccessException rae) {
             // network / DNS / host unreachable
-            System.out.println("Network error when calling generate endpoint: " + rae.getMessage());
-            System.out.println("Falling back to simulated override values.");
+            System.out.println("Network error calling vendor: " + rae.getMessage());
+            System.out.println("Falling back to configured override webhook.");
         } catch (HttpClientErrorException httpEx) {
-            System.out.println("HTTP error from generate endpoint: " + httpEx.getStatusCode() + " - " + httpEx.getResponseBodyAsString());
-            System.out.println("Falling back to simulated override values.");
+            System.out.println("HTTP error from vendor: " + httpEx.getStatusCode() + " - " + httpEx.getResponseBodyAsString());
+            System.out.println("Falling back to configured override webhook.");
         } catch (Exception ex) {
-            System.out.println("Unexpected error when calling generate endpoint: " + ex.getMessage());
-            System.out.println("Falling back to simulated override values.");
+            System.out.println("Unexpected error while calling vendor: " + ex.getMessage());
+            System.out.println("Falling back to configured override webhook.");
         }
 
-        // If nothing from real API, use the override webhook & token
+        // Use override values if vendor data wasn't available
         if (webhookUrl == null || webhookUrl.isBlank()) {
-            webhookUrl = overrideWebhook != null && !overrideWebhook.isBlank() ? overrideWebhook : submitUrl;
+            webhookUrl = (overrideWebhook != null && !overrideWebhook.isBlank()) ? overrideWebhook : submitUrl;
             accessToken = overrideToken;
-            System.out.println("Using override webhook URL: " + webhookUrl);
-            System.out.println("Using override access token (truncated): " + (accessToken.length() > 20 ? accessToken.substring(0, 20) + "..." : accessToken));
+            System.out.println("Using override webhook: " + webhookUrl);
+            System.out.println("Using override token (truncated): " + (accessToken.length() > 20 ? accessToken.substring(0, 20) + "..." : accessToken));
         }
 
-        // Show regNo info (odd/even)
+        // Show whether we got an odd/even reg number assignment
         char lastChar = regNo.trim().charAt(regNo.trim().length() - 1);
         int lastDigit = Character.isDigit(lastChar) ? Character.getNumericValue(lastChar) : -1;
-        System.out.println("regNo last digit: " + lastDigit + " -> " + (lastDigit % 2 == 0 ? "EVEN" : "ODD"));
+        System.out.println("Registration number last digit: " + lastDigit + " -> " + (lastDigit % 2 == 0 ? "EVEN" : "ODD"));
 
-        // Instruction to the user (manual solve step)
-        System.out.println("\n--- NEXT (you): ---");
-        System.out.println("1) Open the question URL from the PDF based on EVEN/ODD and solve the SQL.");
-        System.out.println("2) Re-run this app with -Dapp.finalquery=\"YOUR_SQL_QUERY\" to auto-submit.");
-        System.out.println("   Example (Windows PowerShell): .\\mvnw.cmd spring-boot:run -Dapp.finalquery=\"SELECT ...;\"\n");
+        // Instructions for the person running the app
+        System.out.println("\n--- Next steps for you ---");
+        System.out.println("1) Open the assignment PDF and solve the SQL for your assigned question (odd/even).");
+        System.out.println("2) Re-run with the final SQL using -Dapp.finalquery=\"YOUR_SQL_QUERY\" to auto-submit.");
+        System.out.println("   Example (PowerShell): .\\mvnw.cmd -Dapp.finalquery=\"SELECT ...\" spring-boot:run\n");
 
-        // If final query provided as system property, auto-submit now
+        // If final query is passed as a system property, prefer it; otherwise use the properties value
         String finalQuery = System.getProperty("app.finalquery");
+        if (finalQuery == null || finalQuery.isBlank()) {
+            finalQuery = this.finalQueryFromProperties;
+        }
+
         if (finalQuery != null && !finalQuery.isBlank()) {
             System.out.println("Auto-submit requested. Submitting final query now...");
             submitFinalQuery(webhookUrl, accessToken, finalQuery);
         } else {
-            System.out.println("No final query provided. Solve SQL and re-run with -Dapp.finalquery to submit.");
+            System.out.println("No final query provided. Solve the SQL and re-run with -Dapp.finalquery to submit.");
         }
     }
 
@@ -145,7 +165,7 @@ public class WebhookStartupRunner implements CommandLineRunner {
             System.err.println("Submit HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
         } catch (ResourceAccessException rae) {
             System.err.println("Network error while submitting: " + rae.getMessage());
-            System.err.println("If this happens, you can re-run using a different network or keep using overrides.");
+            System.err.println("You can re-run on a different network or rely on the documented fallback.");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
